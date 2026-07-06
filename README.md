@@ -1,1 +1,156 @@
-# WEEK-1-CAPSTONE-PROJECT-AFYAPLUS-TRIAGE-ENGINE
+# AfyaPlus Triage Engine
+
+Week 1 capstone. Patient types symptoms → AI triages → returns JSON with urgency + routing. Cloud (GPT-4o-mini) first, Ollama (llama3.2) if that fails.
+
+```bash
+pip install openai python-dotenv httpx
+ollama pull llama3.2
+python app.py
+```
+
+`.env` needs your API keys. Sample runs in `sample output/`.
+
+---
+
+## Prompt Engineering Log
+
+Phase 3 asked for **three distinct prompt variations** — one each for general symptom triage, preeclampsia detection, and urgency classification. All three are in `util/prompt.py`. The app runs **V3** (plus two few-shot examples in `util/messages.py`).
+
+| Version | Task focus | Used in app? |
+|---------|-----------|--------------|
+| V1 | General symptom triage | No — first iteration |
+| V2 | Preeclampsia detection | No — second iteration |
+| V3 | Urgency classification + role + CoT + guardrails | Yes |
+
+---
+
+### V1 — General symptom triage
+
+My starting point. Copied the JSON schema from the assignment and kept the prompt short.
+
+**What it did:** read any patient message, list symptoms, decide emergency vs not, return JSON.
+
+**What broke when I tested it:**
+- Model added fluff before the JSON — `"Sure, here is your assessment:"`
+- Hallucinated symptoms (`"I have a headache"` → output included `"stress"` and `"dehydration"`)
+- Routing was inconsistent — `"ER"`, `"Emergency Room"`, `"call 911"` for the same input
+
+**Why I moved on:** fine for basic cases, but no control over output format or behaviour. Still acted like a chatbot.
+
+---
+
+### V2 — Preeclampsia detection
+
+V1 completely missed a pregnancy test case (headache + swelling + blurry vision). The brief calls out preeclampsia detection, so I wrote a separate prompt focused on maternal health.
+
+**What I added:**
+- Preeclampsia warning signs (headaches, swelling, vision changes, high blood pressure)
+- Rules: only use symptoms the patient mentioned, don't diagnose
+
+**What improved:** pregnancy messages routed correctly most of the time.
+
+**What still broke:**
+- Non-pregnancy cases got worse — a broken leg once routed to `"maternal care unit"`
+- No urgency levels, no fixed routing list
+- Still got conversational text on ~1 in 5 runs
+- No step-by-step reasoning
+
+**Why I moved on:** good for one task, bad as a general triage engine. Needed a third prompt that classifies urgency properly and works for all message types.
+
+---
+
+### V3 — Urgency classification (final, used in app)
+
+This is the production prompt. It implements everything Phase 3 requires:
+
+**Role-based assignment**
+- Identity: `"AfyaPlus Triage Engine — a routing system, not a chatbot and not a doctor"`
+- Boundaries: no greeting patients, no medical advice, no dosage calculations
+
+**Chain-of-thought (CoT)**
+- 4 numbered steps the model must follow before outputting JSON:
+  1. Extract symptoms mentioned
+  2. Classify urgency (Critical / Urgent / Routine)
+  3. Write one-sentence reasoning
+  4. Pick a routing destination
+
+**Defensive guardrails**
+- Blacklisted behaviours listed explicitly in the prompt (see next section)
+- Fixed routing list so the model can't invent destinations
+
+**Few-shot examples** (`util/messages.py`): added after testing because llama3.2 still messed up JSON format sometimes. Two examples — chest pain emergency and pregnancy emergency.
+
+**Result:** JSON parses clean on my test cases. Not perfect (local model is slower and sometimes under-routes), but no more fluff or invented symptoms.
+
+---
+
+## Why I Added These Guardrails
+
+Each guardrail in V3 came from a specific failure during testing.
+
+### Conversational fluff & introductory remarks
+
+The backend expects raw JSON. The model kept adding chatty text.
+
+| Guardrail | What happened without it |
+|-----------|-------------------------|
+| No greetings or introductory remarks | Opened with "Hello" or "Thank you for reaching out" |
+| No conversational text | Extra sentences before/after the JSON block |
+| No markdown | Wrapped JSON in \`\`\`json fences |
+| JSON only | Random explanations outside the 4 schema fields |
+
+Code backup: `response_format={'type': 'json_object'}` + `json.loads()` — not relying on the prompt alone.
+
+### Hallucinations & unverified medical calculations
+
+| Guardrail | What happened without it |
+|-----------|-------------------------|
+| Don't diagnose | Said "likely preeclampsia" instead of just routing |
+| Don't invent symptoms | Added `"stress"` to a headache message |
+| No treatment/medicine advice | Suggested "drink water and rest" in the reasoning field |
+| No dosage or medical calculations | Assignment specifically flags this — keeps the engine in triage scope, not clinical math |
+| If message is unclear, say so | Stops guessing when input is just "I don't feel well" |
+
+Code backup: `temperature=0.0` for more deterministic outputs.
+
+---
+
+## Cloud vs Local Latency
+
+Baseline measurements from my dev machine. The app prints `Response generated by {cloud|local} LLM in X.XX seconds` on each run. Four sample runs below — screenshots in `sample output/`.
+
+| # | Screenshot | Test input | Pathway | Model | Latency | Routing result |
+|---|-----------|-----------|---------|-------|---------|----------------|
+| 1 | `Cloud LLM Example 1.png` | "i have a broken leg with exposed bone" | Cloud | gpt-4o-mini | **2.60 s** | Emergency Department |
+| 2 | `Cloud LLM Example 2.png` | "I have cold and running nose" | Cloud | gpt-4o-mini | **3.67 s** | Home Monitoring |
+| 3 | `Local LLM Example 1.png` | "i have a sore throat" | Local (cloud fallback) | llama3.2 | **7.08 s** | General Practitioner |
+| 4 | `Local LLM Example 2.png` | "i have a difficulty breathing" | Local (cloud fallback) | llama3.2 | **6.69 s** | Urgent Care Clinic |
+
+Samples 3 and 4 triggered a cloud error — the terminal prints `LOCAL FALLBACK DUE TO CLOUD ERROR. PLEASE WAIT......` before the local model responds.
+
+| | Cloud (gpt-4o-mini) | Local (llama3.2) |
+|--|---------------------|------------------|
+| Runs recorded | 2 (samples 1, 2) | 2 (samples 3, 4 — fallback) |
+| Avg latency | **3.14 s** | **6.89 s** |
+| Accuracy | Better on edge cases | OK but slower |
+| Offline | No | Yes |
+| Cost | API credits | Free after download |
+| Role | Primary path | Fallback when cloud fails |
+
+Cloud averaged ~3.1 s on the two successful runs. Local fallback averaged ~6.9 s — roughly **2x slower** but kept the app running when cloud failed.
+
+---
+
+## Quick reference
+
+**Output schema:**
+```json
+{
+  "is_critical_emergency": boolean,
+  "detected_symptoms": ["string"],
+  "clinical_reasoning_summary": "string",
+  "routing_destination": "string"
+}
+```
+
+**Key files:** `app.py`, `util/prompt.py`, `util/messages.py`, `util/get_ai_response.py`
